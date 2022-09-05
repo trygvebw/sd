@@ -166,31 +166,38 @@ class CrossAttention(nn.Module):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
-
-    def forward(self, x, context=None, mask=None):
+    
+    def forward(self, x, context=None, mask=None, step_size=4):
+        """From the code by Doggettx here:
+        https://github.com/basujindal/stable-diffusion/pull/117
+        
+        'step_size' must be either 2, 4, 8 or 16."""
         h = self.heads
 
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
+        del context, x
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device)
+        for i in range(0, q.shape[0], step_size):
+            end = i + 4
+            s1 = einsum('b i d, b j d -> b i j', q[i:end], k[i:end])
+            s1 *= self.scale
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
+            s2 = s1.softmax(dim=-1)
+            del s1
 
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
+            r1[i:end] = einsum('b i j, b j d -> b i d', s2, v[i:end])
+            del s2
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+        r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+        del r1
+
+        return self.to_out(r2)
 
 
 class BasicTransformerBlock(nn.Module):
