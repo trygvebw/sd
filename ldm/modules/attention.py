@@ -89,7 +89,7 @@ class LinearAttention(nn.Module):
         b, c, h, w = x.shape
         qkv = self.to_qkv(x)
         q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', heads = self.heads, qkv=3)
-        k = k.softmax(dim=-1)  
+        k = k.softmax(dim=-1)
         context = torch.einsum('bhdn,bhen->bhde', k, v)
         out = torch.einsum('bhde,bhdn->bhen', context, q)
         out = rearrange(out, 'b heads c (h w) -> b (heads c) h w', heads=self.heads, h=h, w=w)
@@ -189,8 +189,9 @@ class CrossAttention(nn.Module):
         mem_free_total = mem_free_cuda + mem_free_torch
 
         gb = 1024 ** 3
-        tensor_size = q.shape[0] * q.shape[1] * k.shape[1] * 4
-        mem_required = tensor_size * 2.5
+        tensor_size = q.shape[0] * q.shape[1] * k.shape[1] * q.element_size()
+        modifier = 3 if q.element_size() == 2 else 2.5
+        mem_required = tensor_size * modifier
         steps = 1
 
         if mem_required > mem_free_total:
@@ -199,16 +200,16 @@ class CrossAttention(nn.Module):
             #       f"torch free:{mem_free_torch/gb:0.1f} total:{mem_free_total/gb:0.1f} steps:{steps}")
 
         if steps > 64:
-            raise RuntimeError(f'Not enough memory, use lower resolution. '
+            max_res = math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
+            raise RuntimeError(f'Not enough memory, use lower resolution (max approx. {max_res}x{max_res}). '
                                f'Need: {mem_required/64/gb:0.1f}GB free, Have:{mem_free_total/gb:0.1f}GB free')
 
         slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
         for i in range(0, q.shape[1], slice_size):
             end = i + slice_size
-            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k)
-            s1 *= self.scale
+            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * self.scale
 
-            s2 = s1.softmax(dim=-1)
+            s2 = s1.softmax(dim=-1, dtype=q.dtype)
             del s1
 
             r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
