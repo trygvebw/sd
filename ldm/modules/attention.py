@@ -166,6 +166,8 @@ class CrossAttention(nn.Module):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
+        
+        self.use_cross_attention_control = False
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
@@ -211,6 +213,25 @@ class CrossAttention(nn.Module):
 
             s2 = s1.softmax(dim=-1, dtype=q.dtype)
             del s1
+            
+            if self.use_cross_attention_control:
+                # From https://github.com/bloc97/CrossAttentionControl/blob/main/CrossAttention_Release.ipynb
+                if self.use_last_attn_slice:
+                    if self.last_attn_slice_mask is not None:
+                        new_attn_slice = torch.index_select(self.last_attn_slice, -1, self.last_attn_slice_indices)
+                        s2 = s2 * (1 - self.last_attn_slice_mask) + new_attn_slice * self.last_attn_slice_mask
+                    else:
+                        s2 = self.last_attn_slice
+
+                    self.use_last_attn_slice = False
+
+                if self.save_last_attn_slice:
+                    self.last_attn_slice = s2
+                    self.save_last_attn_slice = False
+
+                if self.use_last_attn_weights and self.last_attn_slice_weights is not None:
+                    s2 = s2 * self.last_attn_slice_weights
+                    self.use_last_attn_weights = False
 
             r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
             del s2
