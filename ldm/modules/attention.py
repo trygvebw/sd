@@ -168,9 +168,23 @@ class CrossAttention(nn.Module):
         )
         
         self.use_cross_attention_control = False
+        
+        self.use_saved_s2 = False
+        self.saved_s2 = None
+        
+        self.use_saved_r1 = False
+        self.saved_r1 = None
 
     def forward(self, x, context=None, mask=None):
         h = self.heads
+        
+        if self.last_attn_slice is None:
+            self.last_attn_slice = dict()
+        
+        if self.use_saved_r1:
+            context = self.saved_r1
+        else:
+            self.saved_r1 = context
 
         q_in = self.to_q(x)
         context = default(context, x)
@@ -207,6 +221,7 @@ class CrossAttention(nn.Module):
                                f'Need: {mem_required/64/gb:0.1f}GB free, Have:{mem_free_total/gb:0.1f}GB free')
 
         slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
+        #print(q.shape, k.shape, v.shape)
         for i in range(0, q.shape[1], slice_size):
             end = i + slice_size
             s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * self.scale
@@ -218,23 +233,30 @@ class CrossAttention(nn.Module):
                 # From https://github.com/bloc97/CrossAttentionControl/blob/main/CrossAttention_Release.ipynb
                 if self.use_last_attn_slice:
                     if self.last_attn_slice_mask is not None:
-                        new_attn_slice = torch.index_select(self.last_attn_slice, -1, self.last_attn_slice_indices)
+                        new_attn_slice = torch.index_select(self.last_attn_slice[i], -1, self.last_attn_slice_indices)
                         s2 = s2 * (1 - self.last_attn_slice_mask) + new_attn_slice * self.last_attn_slice_mask
                     else:
-                        s2 = self.last_attn_slice
-
-                    self.use_last_attn_slice = False
+                        s2 = self.last_attn_slice[i]
 
                 if self.save_last_attn_slice:
-                    self.last_attn_slice = s2
-                    self.save_last_attn_slice = False
+                    self.last_attn_slice[i] = s2
 
                 if self.use_last_attn_weights and self.last_attn_slice_weights is not None:
                     s2 = s2 * self.last_attn_slice_weights
-                    self.use_last_attn_weights = False
+            
+            if self.use_saved_s2:
+                s2 = self.saved_s2
+            else:
+                self.saved_s2 = s2
 
             r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
+            
             del s2
+        
+        # Reset attention saving
+        self.use_last_attn_slice = False
+        self.save_last_attn_slice = False
+        self.use_last_attn_weights = False
 
         del q, k, v
 
