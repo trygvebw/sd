@@ -150,7 +150,7 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., struct_attn=False):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -174,8 +174,107 @@ class CrossAttention(nn.Module):
         
         self.use_saved_r1 = False
         self.saved_r1 = None
-
+        
+        self.struct_attn = struct_attn
+    
     def forward(self, x, context=None, mask=None):
+        h = self.heads
+
+        q = self.to_q(x)
+        
+        if self.struct_attn and isinstance(context, list):
+            return self._struct_attn_forward(q, context, mask)
+        elif isinstance(context, list):
+            context = torch.cat([context[0], context[1]['k'][0]], dim=0) # use key tensor for context
+        else:
+            context = default(context, x)
+        return self._forward(q, context, mask)
+    
+    def _struct_attn_forward(self, q, context, mask):
+        """
+        context: list of [uc, list of conditional context]
+        """
+        uc_context = context[0]
+        context_k, context_v = context[1]['k'], context[1]['v']
+
+        if isinstance(context_k, list) and isinstance(context_v, list):
+            r2 = self._multi_qkv(q, uc_context, context_k, context_v, mask)
+        elif isinstance(context_k, torch.Tensor) and isinstance(context_v, torch.Tensor):
+            r2 = self._heterogenous_qkv(q, uc_context, context_k, context_v, mask)
+        else:
+            raise NotImplementedError
+
+        return self.to_out(r2)
+
+    def _get_kv(self, context):
+        return self.to_k(context), self.to_v(context)
+    
+    def _multi_qkv(q, uc_context, context_k, context_v, mask):
+        h = self.heads
+
+        assert uc_context.size(0) == context_k[0].size(0) == context_v[0].size(0)
+        true_bs = uc_context.size(0) * h
+
+        k_uc, v_uc = self._get_kv(uc_context)
+        k_c = [self.to_k(c_k) for c_k in context_k]
+        v_c = [self.to_v(c_v) for c_v in context_v]
+        
+        q = rearrange(q, 'b n (h d) -> (b h) n d', h=h)
+
+        k_uc = rearrange(k_uc, 'b n (h d) -> (b h) n d', h=h)            
+        v_uc = rearrange(v_uc, 'b n (h d) -> (b h) n d', h=h)
+
+        k_c  = [rearrange(k, 'b n (h d) -> (b h) n d', h=h) for k in k_c] # NOTE: modification point
+        v_c  = [rearrange(v, 'b n (h d) -> (b h) n d', h=h) for v in v_c]
+
+        # get composition
+        sim_uc = einsum('b i d, b j d -> b i j', q[:true_bs], k_uc) * self.scale
+        sim_c  = [einsum('b i d, b j d -> b i j', q[true_bs:], k) * self.scale for k in k_c]
+
+        attn_uc = sim_uc.softmax(dim=-1)
+        attn_c  = [sim.softmax(dim=-1) for sim in sim_c]
+
+        # get uc output
+        out_uc = einsum('b i j, b j d -> b i d', attn_uc, v_uc)
+
+        # get c output
+        if len(v_c) == 1:
+            out_c_collect = []
+            for attn in attn_c:
+                for v in v_c:
+                    out_c_collect.append(einsum('b i j, b j d -> b i d', attn, v))
+            out_c = sum(out_c_collect) / len(out_c_collect)
+        else:
+            out_c = sum([einsum('b i j, b j d -> b i d', attn, v) for attn, v in zip(attn_c, v_c)]) / len(v_c)
+
+        out = torch.cat([out_uc, out_c], dim=0)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)  
+
+        return out
+    
+    def _heterogenous_qkv(q, uc_context, context_k, context_v, mask):
+        h = self.heads
+        k = self.to_k(torch.cat([uc_context, context_k], dim=0))
+        v = self.to_v(torch.cat([uc_context, context_v], dim=0))
+
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+        if exists(mask):
+            mask = rearrange(mask, 'b ... -> b (...)')
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            sim.masked_fill_(~mask, max_neg_value)
+
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
+
+        out = einsum('b i j, b j d -> b i d', attn, v)
+        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+        return out
+
+    def _forward(self, q_in, context, mask):
         h = self.heads
         
         if self.last_attn_slice is None:
@@ -186,11 +285,9 @@ class CrossAttention(nn.Module):
         else:
             self.saved_r1 = context
 
-        q_in = self.to_q(x)
-        context = default(context, x)
         k_in = self.to_k(context)
         v_in = self.to_v(context)
-        del context, x
+        del context
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q_in, k_in, v_in))
         del q_in, k_in, v_in
@@ -225,6 +322,12 @@ class CrossAttention(nn.Module):
         for i in range(0, q.shape[1], slice_size):
             end = i + slice_size
             s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * self.scale
+            
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(s1.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                s1.masked_fill_(~mask, max_neg_value)
 
             s2 = s1.softmax(dim=-1, dtype=q.dtype)
             del s1

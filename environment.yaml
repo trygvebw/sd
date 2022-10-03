@@ -27,6 +27,8 @@ dependencies:
     - torchmetrics==0.6.0
     - kornia==0.6
     - scikit-image==0.19.3
+    - stanza==1.4.2
+    - nltk==3.7
     - -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
     - -e git+https://github.com/openai/CLIP.git@main#egg=clip
     - -e .
