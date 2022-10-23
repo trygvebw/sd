@@ -168,6 +168,7 @@ class CrossAttention(nn.Module):
         )
         
         self.use_cross_attention_control = False
+        self.last_attn_slice = None
         
         self.use_saved_s2 = False
         self.saved_s2 = None
