@@ -177,11 +177,19 @@ class CrossAttention(nn.Module):
         self.saved_r1 = None
         
         self.struct_attn = struct_attn
+        
+        self.callback1 = lambda *args: None
+        self.callback2 = lambda *args: None
+        
+        self.default_mask = None
     
     def forward(self, x, context=None, mask=None):
         h = self.heads
 
         q = self.to_q(x)
+        
+        if mask is None:
+            mask = self.default_mask
         
         if self.struct_attn and isinstance(context, list):
             return self._struct_attn_forward(q, context, mask)
@@ -331,6 +339,7 @@ class CrossAttention(nn.Module):
                 s1.masked_fill_(~mask, max_neg_value)
 
             s2 = s1.softmax(dim=-1, dtype=q.dtype)
+            self.callback2(s1, s2)
             del s1
             
             if self.use_cross_attention_control:
@@ -356,6 +365,8 @@ class CrossAttention(nn.Module):
             r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
             
             del s2
+        
+        self.callback1(q, k, v)
         
         # Reset attention saving
         self.use_last_attn_slice = False
