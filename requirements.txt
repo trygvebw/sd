@@ -1,0 +1,26 @@
+torch==1.13.0
+torchvision
+numpy
+albumentations
+diffusers
+opencv-python
+pudb
+invisible-watermark
+imageio
+imageio-ffmpeg
+pytorch-lightning
+omegaconf==2.1.1
+test-tube
+streamlit
+einops
+torch-fidelity
+transformers
+torchmetrics
+kornia
+scikit-image
+stanza
+nltk
+Wand
+-e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
+-e git+https://github.com/openai/CLIP.git@main#egg=clip
+-e .
