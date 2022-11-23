@@ -188,7 +188,10 @@ class CrossAttention(nn.Module):
 
         q = self.to_q(x)
         
-        if mask is None:
+        if context is None:
+            # Do not use mask for self-attention
+            mask = None
+        elif mask is None:
             mask = self.default_mask
         
         if self.struct_attn and isinstance(context, list):
@@ -393,12 +396,12 @@ class BasicTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
 
-    def forward(self, x, context=None):
-        return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
+    def forward(self, x, context=None, mask=None):
+        return checkpoint(self._forward, (x, context, mask), self.parameters(), self.checkpoint)
 
-    def _forward(self, x, context=None):
+    def _forward(self, x, context=None, mask=None):
         x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context) + x
+        x = self.attn2(self.norm2(x), context=context, mask=mask) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -435,7 +438,7 @@ class SpatialTransformer(nn.Module):
                                               stride=1,
                                               padding=0))
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, mask=None):
         # note: if no context is given, cross-attention defaults to self-attention
         b, c, h, w = x.shape
         x_in = x
@@ -443,7 +446,7 @@ class SpatialTransformer(nn.Module):
         x = self.proj_in(x)
         x = rearrange(x, 'b c h w -> b (h w) c')
         for block in self.transformer_blocks:
-            x = block(x, context=context)
+            x = block(x, context=context, mask=mask)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         x = self.proj_out(x)
         return x + x_in
