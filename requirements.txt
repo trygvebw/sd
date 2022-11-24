@@ -21,6 +21,7 @@ scikit-image
 stanza
 nltk
 Wand
+open-clip-torch==2.7.0
 -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
 -e git+https://github.com/openai/CLIP.git@main#egg=clip
 -e .
