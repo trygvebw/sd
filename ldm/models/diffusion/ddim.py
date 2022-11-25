@@ -168,30 +168,41 @@ class DDIMSampler(object):
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,
+                      dynamic_threshold=None):
         b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
-            e_t = self.model.apply_model(x, t, c)
+            model_output = self.model.apply_model(x, t, c)
         else:
             x_in = torch.cat([x] * 2)
             t_in = torch.cat([t] * 2)
-            #c_in = torch.cat([unconditional_conditioning, c])
             if isinstance(c, dict):
                 assert isinstance(unconditional_conditioning, dict)
                 c_in = dict()
                 for k in c:
                     if isinstance(c[k], list):
-                        c_in[k] = [
-                            torch.cat([unconditional_conditioning[k][i], c[k][i]])
-                            for i in range(len(c[k]))
-                        ]
+                        c_in[k] = [torch.cat([
+                            unconditional_conditioning[k][i],
+                            c[k][i]]) for i in range(len(c[k]))]
                     else:
-                        c_in[k] = torch.cat([unconditional_conditioning[k], c[k]])
+                        c_in[k] = torch.cat([
+                                unconditional_conditioning[k],
+                                c[k]])
+            elif isinstance(c, list):
+                c_in = list()
+                assert isinstance(unconditional_conditioning, list)
+                for i in range(len(c)):
+                    c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
-            e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
-            e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
+            model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+            model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
+            
+        if self.model.parameterization == "v":
+            e_t = self.model.predict_eps_from_z_and_v(x, t, model_output)
+        else:
+            e_t = model_output
 
         if score_corrector is not None:
             assert self.model.parameterization == "eps"
@@ -208,9 +219,17 @@ class DDIMSampler(object):
         sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
 
         # current prediction for x_0
-        pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+        if self.model.parameterization != "v":
+            pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+        else:
+            pred_x0 = self.model.predict_start_from_z_and_v(x, t, model_output)
+
         if quantize_denoised:
             pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
+
+        if dynamic_threshold is not None:
+            raise NotImplementedError()
+
         # direction pointing to x_t
         dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
         noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature

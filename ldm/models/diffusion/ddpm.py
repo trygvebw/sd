@@ -74,7 +74,7 @@ class DDPM(pl.LightningModule):
                  logvar_init=0.,
                  ):
         super().__init__()
-        assert parameterization in ["eps", "x0"], 'currently only supporting "eps" and "x0"'
+        assert parameterization in ["eps", "x0", "v"], 'currently only supporting "eps" and "x0" and "v"'
         self.parameterization = parameterization
         print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
         self.cond_stage_model = None
@@ -162,6 +162,9 @@ class DDPM(pl.LightningModule):
                         2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod))
         elif self.parameterization == "x0":
             lvlb_weights = 0.5 * np.sqrt(torch.Tensor(alphas_cumprod)) / (2. * 1 - torch.Tensor(alphas_cumprod))
+        elif self.parameterization == "v":
+            lvlb_weights = torch.ones_like(self.betas ** 2 / (
+                    2 * self.posterior_variance * to_torch(alphas) * (1 - self.alphas_cumprod)))
         else:
             raise NotImplementedError("mu not supported")
         # TODO how to choose this term
@@ -218,6 +221,20 @@ class DDPM(pl.LightningModule):
         return (
                 extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
                 extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+    
+    def predict_start_from_z_and_v(self, x_t, t, v):
+        # self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod)))
+        # self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod)))
+        return (
+                extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def predict_eps_from_z_and_v(self, x_t, t, v):
+        return (
+                extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * v +
+                extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * x_t
         )
 
     def q_posterior(self, x_start, x_t, t):
@@ -302,6 +319,8 @@ class DDPM(pl.LightningModule):
             target = noise
         elif self.parameterization == "x0":
             target = x_start
+        elif self.parameterization == "v":
+            target = self.get_v(x_start, noise, t)
         else:
             raise NotImplementedError(f"Paramterization {self.parameterization} not yet supported")
 
@@ -1024,6 +1043,8 @@ class LatentDiffusion(DDPM):
             target = x_start
         elif self.parameterization == "eps":
             target = noise
+        elif self.parameterization == "v":
+            target = self.get_v(x_start, noise, t)
         else:
             raise NotImplementedError()
 
