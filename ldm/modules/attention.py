@@ -138,7 +138,7 @@ class SpatialSelfAttention(nn.Module):
         v = self.v(h_)
 
         # compute attention
-        b,c,h,w = q.shape
+        b, c, h, w = q.shape
         q = rearrange(q, 'b c h w -> b (h w) c')
         k = rearrange(k, 'b c h w -> b c (h w)')
         w_ = torch.einsum('bij,bjk->bik', q, k)
@@ -173,132 +173,44 @@ class CrossAttention(nn.Module):
             nn.Linear(inner_dim, query_dim),
             nn.Dropout(dropout)
         )
-        
+
         self.use_cross_attention_control = False
         self.last_attn_slice = None
-        
+
         self.use_saved_s2 = False
         self.saved_s2 = None
-        
+
         self.use_saved_r1 = False
         self.saved_r1 = None
-        
+
         self.struct_attn = struct_attn
-        
+
         self.callback1 = lambda *args: None
         self.callback2 = lambda *args: None
-        
-        self.default_mask = None
-    
-    def forward(self, x, context=None, mask=None):
-        h = self.heads
 
+        self.default_mask = None
+
+    def forward(self, x, context=None, mask=None):
         q = self.to_q(x)
-        
+
         if context is None:
             # Do not use mask for self-attention
             mask = None
         elif mask is None:
             mask = self.default_mask
-        
-        if self.struct_attn and isinstance(context, list):
-            return self._struct_attn_forward(q, context, mask)
-        elif isinstance(context, list):
-            context = torch.cat([context[0], context[1]['k'][0]], dim=0) # use key tensor for context
+
+        if isinstance(context, list):
+            context = torch.cat([context[0], context[1]['k'][0]], dim=0)  # use key tensor for context
         else:
             context = default(context, x)
         return self._forward(q, context, mask)
-    
-    def _struct_attn_forward(self, q, context, mask):
-        """
-        context: list of [uc, list of conditional context]
-        """
-        uc_context = context[0]
-        context_k, context_v = context[1]['k'], context[1]['v']
-
-        if isinstance(context_k, list) and isinstance(context_v, list):
-            r2 = self._multi_qkv(q, uc_context, context_k, context_v, mask)
-        elif isinstance(context_k, torch.Tensor) and isinstance(context_v, torch.Tensor):
-            r2 = self._heterogenous_qkv(q, uc_context, context_k, context_v, mask)
-        else:
-            raise NotImplementedError
-
-        return self.to_out(r2)
-
-    def _get_kv(self, context):
-        return self.to_k(context), self.to_v(context)
-    
-    def _multi_qkv(q, uc_context, context_k, context_v, mask):
-        h = self.heads
-
-        assert uc_context.size(0) == context_k[0].size(0) == context_v[0].size(0)
-        true_bs = uc_context.size(0) * h
-
-        k_uc, v_uc = self._get_kv(uc_context)
-        k_c = [self.to_k(c_k) for c_k in context_k]
-        v_c = [self.to_v(c_v) for c_v in context_v]
-        
-        q = rearrange(q, 'b n (h d) -> (b h) n d', h=h)
-
-        k_uc = rearrange(k_uc, 'b n (h d) -> (b h) n d', h=h)            
-        v_uc = rearrange(v_uc, 'b n (h d) -> (b h) n d', h=h)
-
-        k_c  = [rearrange(k, 'b n (h d) -> (b h) n d', h=h) for k in k_c] # NOTE: modification point
-        v_c  = [rearrange(v, 'b n (h d) -> (b h) n d', h=h) for v in v_c]
-
-        # get composition
-        sim_uc = einsum('b i d, b j d -> b i j', q[:true_bs], k_uc) * self.scale
-        sim_c  = [einsum('b i d, b j d -> b i j', q[true_bs:], k) * self.scale for k in k_c]
-
-        attn_uc = sim_uc.softmax(dim=-1)
-        attn_c  = [sim.softmax(dim=-1) for sim in sim_c]
-
-        # get uc output
-        out_uc = einsum('b i j, b j d -> b i d', attn_uc, v_uc)
-
-        # get c output
-        if len(v_c) == 1:
-            out_c_collect = []
-            for attn in attn_c:
-                for v in v_c:
-                    out_c_collect.append(einsum('b i j, b j d -> b i d', attn, v))
-            out_c = sum(out_c_collect) / len(out_c_collect)
-        else:
-            out_c = sum([einsum('b i j, b j d -> b i d', attn, v) for attn, v in zip(attn_c, v_c)]) / len(v_c)
-
-        out = torch.cat([out_uc, out_c], dim=0)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)  
-
-        return out
-    
-    def _heterogenous_qkv(q, uc_context, context_k, context_v, mask):
-        h = self.heads
-        k = self.to_k(torch.cat([uc_context, context_k], dim=0))
-        v = self.to_v(torch.cat([uc_context, context_v], dim=0))
-
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
-
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
-
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
-
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return out
 
     def _forward(self, q_in, context, mask):
         h = self.heads
-        
+
         if self.last_attn_slice is None:
             self.last_attn_slice = dict()
-        
+
         if self.use_saved_r1:
             context = self.saved_r1
         else:
@@ -328,8 +240,6 @@ class CrossAttention(nn.Module):
 
         if mem_required > mem_free_total:
             steps = 2**(math.ceil(math.log(mem_required / mem_free_total, 2)))
-            # print(f"Expected tensor size:{tensor_size/gb:0.1f}GB, cuda free:{mem_free_cuda/gb:0.1f}GB "
-            #       f"torch free:{mem_free_torch/gb:0.1f} total:{mem_free_total/gb:0.1f} steps:{steps}")
 
         if steps > 64:
             max_res = math.floor(math.sqrt(math.sqrt(mem_free_total / 2.5)) / 8) * 64
@@ -337,11 +247,17 @@ class CrossAttention(nn.Module):
                                f'Need: {mem_required/64/gb:0.1f}GB free, Have:{mem_free_total/gb:0.1f}GB free')
 
         slice_size = q.shape[1] // steps if (q.shape[1] % steps) == 0 else q.shape[1]
-        #print(q.shape, k.shape, v.shape)
         for i in range(0, q.shape[1], slice_size):
             end = i + slice_size
-            s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * self.scale
-            
+            #s1 = einsum('b i d, b j d -> b i j', q[:, i:end], k) * self.scale
+            s1 = torch.baddbmm(
+                torch.empty(q.shape[0], slice_size, k.shape[1], dtype=q.dtype, device=q.device),
+                q[:, i:end],
+                k.transpose(-1, -2),
+                beta=0,
+                alpha=self.scale,
+            )
+
             if exists(mask):
                 mask = rearrange(mask, 'b ... -> b (...)')
                 max_neg_value = -torch.finfo(s1.dtype).max
@@ -351,33 +267,23 @@ class CrossAttention(nn.Module):
             s2 = s1.softmax(dim=-1, dtype=q.dtype)
             self.callback2(s1, s2)
             del s1
-            
+
             if self.use_cross_attention_control:
-                # From https://github.com/bloc97/CrossAttentionControl/blob/main/CrossAttention_Release.ipynb
-                if self.use_last_attn_slice:
-                    if self.last_attn_slice_mask is not None:
-                        new_attn_slice = torch.index_select(self.last_attn_slice[i], -1, self.last_attn_slice_indices)
-                        s2 = s2 * (1 - self.last_attn_slice_mask) + new_attn_slice * self.last_attn_slice_mask
-                    else:
-                        s2 = self.last_attn_slice[i]
+                # Cross-attention control
+                s2 = self._cac_get_s2(s2, i)
 
-                if self.save_last_attn_slice:
-                    self.last_attn_slice[i] = s2
-
-                if self.use_last_attn_weights and self.last_attn_slice_weights is not None:
-                    s2 = s2 * self.last_attn_slice_weights
-            
             if self.use_saved_s2:
                 s2 = self.saved_s2
             else:
                 self.saved_s2 = s2
 
-            r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
-            
+            #r1[:, i:end] = einsum('b i j, b j d -> b i d', s2, v)
+            r1[:, i:end] = torch.bmm(s2, v)
+
             del s2
-        
+
         self.callback1(q, k, v)
-        
+
         # Reset attention saving
         self.use_last_attn_slice = False
         self.save_last_attn_slice = False
@@ -390,17 +296,82 @@ class CrossAttention(nn.Module):
 
         return self.to_out(r2)
 
+    def _cac_get_s2(self, s2, slice_idx):
+        # From https://github.com/bloc97/CrossAttentionControl/blob/main/CrossAttention_Release.ipynb
+        if self.use_last_attn_slice:
+            if self.last_attn_slice_mask is not None:
+                new_attn_slice = torch.index_select(self.last_attn_slice[slice_idx], -1, self.last_attn_slice_indices)
+                s2 = s2 * (1 - self.last_attn_slice_mask) + new_attn_slice * self.last_attn_slice_mask
+            else:
+                s2 = self.last_attn_slice[slice_idx]
+
+        if self.save_last_attn_slice:
+            self.last_attn_slice[slice_idx] = s2
+
+        if self.use_last_attn_weights and self.last_attn_slice_weights is not None:
+            s2 = s2 * self.last_attn_slice_weights
+
+        return s2
+
+
+class MemoryEfficientCrossAttention(nn.Module):
+    # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+        self.attention_op = None
+
+    def forward(self, x, context=None, mask=None):
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        b, _, _ = q.shape
+        q, k, v = map(
+            lambda t: t.unsqueeze(3)
+            .reshape(b, t.shape[1], self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b * self.heads, t.shape[1], self.dim_head)
+            .contiguous(),
+            (q, k, v),
+        )
+
+        # actually compute the attention, what we cannot get enough of
+        out = xformers.ops.memory_efficient_attention(q, k, v,
+                                                      attn_bias=mask,
+                                                      op=self.attention_op)
+
+        out = (
+            out.unsqueeze(0)
+            .reshape(b, self.heads, out.shape[1], self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b, out.shape[1], self.heads * self.dim_head)
+        )
+        return self.to_out(out)
+
 
 class BasicTransformerBlock(nn.Module):
     ATTENTION_MODES = {
-        "softmax": CrossAttention,  # vanilla attention
-        #"softmax-xformers": MemoryEfficientCrossAttention
+        "softmax": CrossAttention,
+        "softmax-xformers": MemoryEfficientCrossAttention
     }
+
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
                  disable_self_attn=False):
         super().__init__()
         #attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
-        attn_mode = "softmax"
+        attn_mode = 'softmax'
         assert attn_mode in self.ATTENTION_MODES
         attn_cls = self.ATTENTION_MODES[attn_mode]
         self.disable_self_attn = disable_self_attn

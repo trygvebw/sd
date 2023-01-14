@@ -1,4 +1,4 @@
-torch==1.13.0
+torch==1.12.1
 torchvision
 numpy
 albumentations
@@ -8,7 +8,7 @@ pudb
 invisible-watermark
 imageio
 imageio-ffmpeg
-pytorch-lightning==1.6.5
+pytorch-lightning
 omegaconf==2.1.1
 test-tube
 streamlit
@@ -24,10 +24,6 @@ Wand
 open-clip-torch==2.7.0
 geomstats
 opt_einsum
-captionizer
-ninja<1.12
-bitsandbytes~=0.35.4
--e git+https://github.com/facebookresearch/xformers.git@main#egg=xformers
 -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
 -e git+https://github.com/openai/CLIP.git@main#egg=clip
 -e .
