@@ -10,6 +10,57 @@ from ldm.util import instantiate_from_config
 from ldm.modules.attention import LinearAttention, SpatialSelfAttention
 
 
+class AttnBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+
+        self.norm = Normalize(in_channels)
+        self.q = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.k = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.v = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.proj_out = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0)
+
+    def forward(self, x, upcast_attn=True, mem_efficient=False):
+        # https://github.com/AUTOMATIC1111/stable-diffusion-webui/pull/8367/files
+        h_ = x
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+        b, c, h, w = q.shape
+        q, k, v = map(lambda t: rearrange(t, 'b c h w -> b (h w) c'), (q, k, v))
+        dtype = q.dtype
+        if upcast_attn:
+            q, k = q.float(), k.float()
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=mem_efficient):
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+
+        out = out.to(dtype)
+        out = rearrange(out, 'b (h w) c -> b c h w', h=h)
+        out = self.proj_out(out)
+        return x + out
+
 def get_timestep_embedding(timesteps, embedding_dim):
     """
     This matches the implementation in Denoising Diffusion Probabilistic Models:
@@ -168,7 +219,8 @@ def make_attn(in_channels, attn_type="vanilla"):
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
     #print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
     if attn_type == "vanilla":
-        return SpatialSelfAttention(in_channels)
+        return AttnBlock(in_channels)
+        #return SpatialSelfAttention(in_channels)
     elif attn_type == "none":
         return nn.Identity(in_channels)
     else:
@@ -651,7 +703,8 @@ class LatentRescaler(nn.Module):
                                                      out_channels=mid_channels,
                                                      temb_channels=0,
                                                      dropout=0.0) for _ in range(depth)])
-        self.attn = SpatialSelfAttention(mid_channels)
+        #self.attn = SpatialSelfAttention(mid_channels)
+        self.attn = AttnBlock(mid_channels)
         self.res_block2 = nn.ModuleList([ResnetBlock(in_channels=mid_channels,
                                                      out_channels=mid_channels,
                                                      temb_channels=0,

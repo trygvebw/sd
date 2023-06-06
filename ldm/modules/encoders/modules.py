@@ -139,10 +139,10 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
     def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77):
         super().__init__()
-        
+
         if version is not None and 'openai' not in version:
             CLIPTokenizer.vocab_files_names["merges_file"] = "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/merges.txt" # to support laion clip
-        
+
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
         self.device = device
@@ -193,12 +193,11 @@ class FrozenCLIPTextEmbedder(nn.Module):
 
     def encode(self, text):
         z = self(text)
-        if z.ndim==2:
+        if z.ndim == 2:
             z = z[:, None, :]
         z = repeat(z, 'b 1 d -> b k d', k=self.n_repeat)
         return z
 
-    
 class FrozenOpenCLIPEmbedder(AbstractEncoder):
     """
     Uses the OpenCLIP transformer encoder for text
@@ -208,6 +207,7 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
         "last",
         "penultimate"
     ]
+
     def __init__(self, arch="ViT-H-14", version="laion2b_s32b_b79k", device="cuda", max_length=77,
                  freeze=True, layer="last"):
         super().__init__()

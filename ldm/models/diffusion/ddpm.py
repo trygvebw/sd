@@ -19,12 +19,13 @@ from omegaconf import ListConfig
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities import rank_zero_only
 
-from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
-from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
-from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
-from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.state_manager import DiffusionStateManager
+from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
+from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianDistribution
+from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
+from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -77,6 +78,7 @@ class DDPM(pl.LightningModule):
         assert parameterization in ["eps", "x0", "v"], 'currently only supporting "eps" and "x0" and "v"'
         self.parameterization = parameterization
         print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
+        self.state_mgr = DiffusionStateManager()
         self.cond_stage_model = None
         self.clip_denoised = clip_denoised
         self.log_every_t = log_every_t
@@ -84,7 +86,7 @@ class DDPM(pl.LightningModule):
         self.image_size = image_size  # try conv?
         self.channels = channels
         self.use_positional_encodings = use_positional_encodings
-        self.model = DiffusionWrapper(unet_config, conditioning_key)
+        self.model = DiffusionWrapper(unet_config, conditioning_key, state_mgr=self.state_mgr)
         count_params(self.model, verbose=True)
         self.use_ema = use_ema
         if self.use_ema:
@@ -114,6 +116,9 @@ class DDPM(pl.LightningModule):
         if self.learn_logvar:
             self.logvar = nn.Parameter(self.logvar, requires_grad=True)
 
+        for module_path, submodule in self.named_modules():
+            submodule.module_path = module_path
+            submodule.state_mgr = self.state_mgr
 
     def register_schedule(self, given_betas=None, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
@@ -459,6 +464,7 @@ class LatentDiffusion(DDPM):
         self.scale_by_std = scale_by_std
         assert self.num_timesteps_cond <= kwargs['timesteps']
         # for backwards compatibility after implementation of DiffusionWrapper
+        self.orig_conditioning_key = conditioning_key
         if conditioning_key is None:
             conditioning_key = 'concat' if concat_mode else 'crossattn'
         if cond_stage_config == '__is_unconditional__':
@@ -908,10 +914,9 @@ class LatentDiffusion(DDPM):
 
         return [rescale_bbox(b) for b in bboxes]
 
-    def apply_model(self, x_noisy, t, cond, return_ids=False, attn_mask=None):
+    def apply_model(self, x_noisy, t, cond, return_ids=False, attn_mask=None, callback=None, attn_kwargs=None):
         #if attn_mask is None:
         #    attn_mask = torch.ones((x_noisy.shape[0], 77, 768), device=x_noisy.device).bool()
-
         if isinstance(cond, dict):
             # hybrid case, cond is exptected to be a dict
             pass
@@ -994,7 +999,10 @@ class LatentDiffusion(DDPM):
                 cond_list = [cond for i in range(z.shape[-1])]  # Todo make this more efficient
 
             # apply model by loop over crops
-            output_list = [self.model(z_list[i], t, mask=attn_mask, **cond_list[i]) for i in range(z.shape[-1])]
+            output_list = [
+                self.model(z_list[i], t, mask=attn_mask, callback=callback, **cond_list[i], attn_kwargs=attn_kwargs)
+                for i in range(z.shape[-1])
+            ]
             assert not isinstance(output_list[0],
                                   tuple)  # todo cant deal with multiple model outputs check this never happens
 
@@ -1006,7 +1014,7 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, mask=attn_mask, **cond)
+            x_recon = self.model(x_noisy, t, mask=attn_mask, callback=callback, **cond, attn_kwargs=attn_kwargs)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -1270,7 +1278,6 @@ class LatentDiffusion(DDPM):
 
         return samples, intermediates
 
-
     @torch.no_grad()
     def get_unconditional_conditioning(self, batch_size, null_label=None):
         if null_label is not None:
@@ -1288,7 +1295,6 @@ class LatentDiffusion(DDPM):
             raise NotImplementedError()
         c = repeat(c, "1 ... -> b ...", b=batch_size).to(self.device)
         return c
-
 
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
@@ -1356,8 +1362,8 @@ class LatentDiffusion(DDPM):
                     self.first_stage_model, IdentityFirstStage):
                 # also display when quantizing x0 while sampling
                 with self.ema_scope("Plotting Quantized Denoised"):
-                    samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
-                                                             ddim_steps=ddim_steps,eta=ddim_eta,
+                    samples, z_denoise_row = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                             ddim_steps=ddim_steps, eta=ddim_eta,
                                                              quantize_denoised=True)
                     # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
                     #                                      quantize_denoised=True)
@@ -1436,28 +1442,29 @@ class LatentDiffusion(DDPM):
 
 
 class DiffusionWrapper(pl.LightningModule):
-    def __init__(self, diff_model_config, conditioning_key):
+    def __init__(self, diff_model_config, conditioning_key, state_mgr=None):
         super().__init__()
-        self.diffusion_model = instantiate_from_config(diff_model_config)
+        self.state_mgr = DiffusionStateManager.use_or_create(state_mgr)
+        self.diffusion_model = instantiate_from_config(diff_model_config, state_mgr=self.state_mgr)
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, mask=None, c_concat: list = None, c_crossattn: list = None):
+    def forward(self, x, t, mask=None, callback=None, c_concat: list = None, c_crossattn: list = None, attn_kwargs=None):
         if self.conditioning_key is None:
-            out = self.diffusion_model(x, t, mask=mask)
+            out = self.diffusion_model(x, t, mask=mask, callback=callback, attn_kwargs=attn_kwargs)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=1)
-            out = self.diffusion_model(xc, t, mask=mask)
+            out = self.diffusion_model(xc, t, mask=mask, callback=callback, attn_kwargs=attn_kwargs)
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(x, t, context=cc, mask=mask)
+            out = self.diffusion_model(x, t, context=c_crossattn, mask=mask, callback=callback, attn_kwargs=attn_kwargs)
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
-            out = self.diffusion_model(xc, t, context=cc, mask=mask)
+            out = self.diffusion_model(xc, t, context=cc, mask=mask, callback=callback, attn_kwargs=attn_kwargs)
         elif self.conditioning_key == 'adm':
             cc = c_crossattn[0]
-            out = self.diffusion_model(x, t, y=cc, mask=mask)
+            out = self.diffusion_model(x, t, y=cc, mask=mask, callback=callback, attn_kwargs=attn_kwargs)
         else:
             raise NotImplementedError()
 
